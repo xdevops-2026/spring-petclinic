@@ -1,0 +1,165 @@
+name: CI - Java Maven Build & Container Image
+
+on:
+  push:
+    branches: [ develop ]
+    paths:
+      - 'pom.xml'
+      - 'src/**'
+      - 'Containerfile'
+      - 'Dockerfile'
+      - '.github/workflows/ci-develop-java-maven.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}          # includes owner/repo, used for GHCR image naming
+  ARTIFACT_NAME: ${{ github.event.repository.name }}-jar  # repo name only, used for uploading/downloading jar artifact
+  JAVA_VERSION: 17                              # set to 17 or 21 to match this application
+  MAVEN_REPO_ID: github                         # default to GitHub Packages (matches setup-java server-id); change to your internal repo server id
+  MAVEN_REPO_URL: https://maven.pkg.github.com/${{ github.repository }}  # change to your internal repo URL (e.g., Nexus/Artifactory release/snapshot URL)
+
+jobs:
+  build-jar:
+    name: Build jar artifact
+    runs-on: ubuntu-latest
+    outputs:
+      version_id: ${{ steps.set-version.outputs.version_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secret scan
+        uses: trufflesecurity/trufflehog@v3.92.4
+        with:
+          path: .
+          extra_args: --only-verified
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+      - name: Compute Version ID from pom.xml
+        id: set-version
+        run: |
+          PROJECT_VERSION=$(mvn -q -DforceStdout -Dexpression=project.version --no-transfer-progress help:evaluate | tail -1)
+          PROJECT_VERSION=${PROJECT_VERSION:-0.0.0}
+          CLEAN_VERSION=$(echo "$PROJECT_VERSION" | sed 's/-SNAPSHOT$//')
+
+          if [ "${GITHUB_REF}" = "refs/heads/develop" ]; then
+            VERSION_SUFFIX="-SNAPSHOT"
+          else
+            VERSION_SUFFIX=""
+          fi
+
+          VERSION_ID="${CLEAN_VERSION}${VERSION_SUFFIX:+$VERSION_SUFFIX}-${GITHUB_SHA::7}"
+          echo "VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
+          echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
+      - name: Set project version to VERSION_ID
+        run: mvn -B versions:set -DnewVersion="$VERSION_ID" -DgenerateBackupPoms=false --no-transfer-progress
+      - name: Run project checks and tests
+        run: mvn -B --no-transfer-progress verify
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/**
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Publish test summary
+        if: always()
+        uses: dorny/test-reporter@v2.4.0
+        with:
+          name: Maven tests
+          reporter: java-junit
+          path: |
+            **/target/surefire-reports/*.xml
+          fail-on-empty: false
+      - name: Package application
+        run: mvn -B -DskipTests --no-transfer-progress package
+      - name: Deploy jar to repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          mvn -B -DskipTests --no-transfer-progress \
+            -DaltDeploymentRepository=${{ env.MAVEN_REPO_ID }}::default::${{ env.MAVEN_REPO_URL }} \
+            deploy
+      - name: Rename jar for image build
+        run: |
+          mkdir -p target
+          JAR_FILE=$(ls target/*.jar | head -n 1)
+          mv "$JAR_FILE" target/app.jar
+      - name: Upload jar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: target/app.jar
+          retention-days: 7
+
+  build-image:
+    name: Build & push container image
+    runs-on: ubuntu-latest
+    needs: [build-jar]
+    env:
+      VERSION_ID: ${{ needs.build-jar.outputs.version_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select container build file
+        run: |
+          if [ -f Containerfile ]; then
+            echo "BUILD_FILE=Containerfile" >> $GITHUB_ENV
+          elif [ -f Dockerfile ]; then
+            echo "BUILD_FILE=Dockerfile" >> $GITHUB_ENV
+          else
+            echo "No Containerfile or Dockerfile found" >&2
+            exit 1
+          fi
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: target
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ env.BUILD_FILE }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          # tags:
+          # - immutable per build (includes short SHA, SNAPSHOT on develop)
+          # - snapshot moves to latest CI build
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_ID }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:snapshot
+          build-args: |
+            APP_JAR=target/app.jar
+            VERSION=${{ env.VERSION_ID }}
+            COMMIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION_ID }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
