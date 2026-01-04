@@ -15,6 +15,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -41,6 +42,22 @@ jobs:
         with:
           path: .
           extra_args: --only-verified
+      - name: Scan for CVEs
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-code.sarif
+      - name: Upload CVE scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cve-scan-report
+          path: trivy-code.sarif
+          retention-days: 7
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -62,7 +79,8 @@ jobs:
             VERSION_SUFFIX=""
           fi
 
-          VERSION_ID="${CLEAN_VERSION}${VERSION_SUFFIX:+$VERSION_SUFFIX}-${GITHUB_SHA::7}"
+          RUN_SUFFIX="-b${GITHUB_RUN_NUMBER:-0}"
+          VERSION_ID="${CLEAN_VERSION}${VERSION_SUFFIX:+$VERSION_SUFFIX}-${GITHUB_SHA::7}${RUN_SUFFIX}"
           echo "VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
           echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
       - name: Set project version to VERSION_ID
@@ -142,13 +160,51 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build & push image
+      - name: Build image locally for scan (cacheable, amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ env.BUILD_FILE }}
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: localbuild:${{ env.VERSION_ID }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_JAR=target/app.jar
+            VERSION=${{ env.VERSION_ID }}
+            COMMIT_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION_ID }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Scan built image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: localbuild:${{ env.VERSION_ID }}
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-image.sarif
+      - name: Upload image scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-scan-report
+          path: trivy-image.sarif
+          retention-days: 7
+      - name: Build & push image (reuse cache)
+        id: push-image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ${{ env.BUILD_FILE }}
           push: true
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
           # tags:
           # - immutable per build (includes short SHA, SNAPSHOT on develop)
           # - snapshot moves to latest CI build
@@ -162,4 +218,10 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ env.VERSION_ID }}
             org.opencontainers.image.revision=${{ github.sha }}
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push-image.outputs.digest }}
+          push-to-registry: true
 
