@@ -112,8 +112,6 @@ jobs:
           path: |
             **/target/surefire-reports/*.xml
           fail-on-empty: false
-      - name: Package application
-        run: mvn -B -DskipTests --no-transfer-progress package
       - name: Deploy jar to repository
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
