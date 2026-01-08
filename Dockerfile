@@ -10,6 +10,4 @@ WORKDIR ${APP_HOME}
 # Labels are injected at image build time by the CI workflow; none defined here.
 COPY ${APP_JAR} app.jar
 
-EXPOSE 8080
-
 CMD ["sh", "-c", "exec java ${JAVA_OPTS} -jar app.jar"]
