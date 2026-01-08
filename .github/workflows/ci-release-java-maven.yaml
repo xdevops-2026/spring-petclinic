@@ -6,6 +6,7 @@ on:
     paths:
       - 'pom.xml'
       - 'src/**'
+      - 'Containerfile'
       - 'Dockerfile'
       - '.github/workflows/ci-release-java-maven.yaml'
   workflow_dispatch:
@@ -23,6 +24,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   JAVA_VERSION: 17
+  MAVEN_REPO_ID: github
+  MAVEN_REPO_URL: https://maven.pkg.github.com/${{ github.repository }}
 
 jobs:
   build-jar:
@@ -66,6 +69,9 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
 
       - name: Compute release candidate version and artifact name
         id: set-version
@@ -97,6 +103,15 @@ jobs:
 
       - name: Run project checks and tests
         run: mvn -B --no-transfer-progress verify
+
+      - name: Deploy jar to repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          mvn -B -DskipTests --no-transfer-progress \
+            -DaltDeploymentRepository=${{ env.MAVEN_REPO_ID }}::default::${{ env.MAVEN_REPO_URL }} \
+            deploy
 
       - name: Prepare jar path for image build
         run: |
@@ -133,10 +148,12 @@ jobs:
 
       - name: Select container build file
         run: |
-          if [ -f Dockerfile ]; then
+          if [ -f Containerfile ]; then
+            echo "BUILD_FILE=Containerfile" >> "$GITHUB_ENV"
+          elif [ -f Dockerfile ]; then
             echo "BUILD_FILE=Dockerfile" >> "$GITHUB_ENV"
           else
-            echo "Dockerfile not found" >&2
+            echo "No Containerfile or Dockerfile found" >&2
             exit 1
           fi
 
