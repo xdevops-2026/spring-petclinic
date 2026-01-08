@@ -34,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version_id: ${{ steps.set-version.outputs.version_id }}
+      image_version_id: ${{ steps.set-version.outputs.image_version_id }}
       artifact_name: ${{ steps.set-version.outputs.artifact_name }}
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +82,7 @@ jobs:
 
           RUN_SUFFIX="-b${GITHUB_RUN_NUMBER:-0}"
           VERSION_ID="${CLEAN_VERSION}${VERSION_SUFFIX:+$VERSION_SUFFIX}-${GITHUB_SHA::7}${RUN_SUFFIX}"
+          IMAGE_VERSION_ID=$(echo "$VERSION_ID" | tr '[:upper:]' '[:lower:]')
 
           ARTIFACT_ID=$(mvn -q -DforceStdout -Dexpression=project.artifactId --no-transfer-progress help:evaluate | tail -1)
           ARTIFACT_ID=${ARTIFACT_ID:-app}
@@ -89,6 +91,7 @@ jobs:
 
           echo "VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
           echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
+          echo "image_version_id=$IMAGE_VERSION_ID" >> $GITHUB_OUTPUT
           echo "artifact_name=$ARTIFACT_VERSIONED" >> $GITHUB_OUTPUT
       - name: Set project version to VERSION_ID
         run: mvn -B versions:set -DnewVersion="$VERSION_ID" -DgenerateBackupPoms=false --no-transfer-progress
@@ -144,6 +147,7 @@ jobs:
     needs: [build-jar]
     env:
       VERSION_ID: ${{ needs.build-jar.outputs.version_id }}
+      IMAGE_VERSION_ID: ${{ needs.build-jar.outputs.image_version_id }}
     steps:
       - uses: actions/checkout@v4
       - name: Select container build file
@@ -183,7 +187,7 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_ID }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION_ID }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop
           labels: |
             org.opencontainers.image.version=${{ env.VERSION_ID }}
@@ -192,7 +196,7 @@ jobs:
         uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: image
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_ID }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION_ID }}
           ignore-unfixed: true
           severity: CRITICAL,HIGH
           format: sarif
@@ -206,7 +210,7 @@ jobs:
           retention-days: 7
       - name: Push image tags to GHCR
         env:
-          IMAGE_VERSION_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_ID }}
+          IMAGE_VERSION_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION_ID }}
           IMAGE_DEVELOP_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop
         run: |
           docker push "${IMAGE_VERSION_TAG}"
@@ -214,7 +218,7 @@ jobs:
       - name: Get pushed digest
         id: image-digest
         env:
-          IMAGE_VERSION_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_ID }}
+          IMAGE_VERSION_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION_ID }}
         run: |
           REPO_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_VERSION_TAG}" 2>/dev/null || true)
           if [ -z "$REPO_DIGEST" ]; then
